@@ -5,10 +5,10 @@ import asyncio
 
 import aiohttp
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, html, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -28,6 +28,7 @@ dp = Dispatcher()
 
 
 class ConvertFlow(StatesGroup):
+    choosing_lang: State = State()
     choosing_from_cat = State()  # picking category for source
     choosing_from = State()  # picking source currency
     choosing_to_cat = State()  # picking category for target
@@ -35,17 +36,81 @@ class ConvertFlow(StatesGroup):
     entering_amt = State()  # entering amount
 
 
+# -- Language storage (in-memory, survives per bot session) --
+
+user_lang: dict[int, str] = {}  # user_id -> "en" | "ua"
+
+
+def get_lang(user_id: int) -> str:
+    return user_lang.get(user_id, "en")
+
+
+# -- Translations --
+
+STRINGS: dict[str, dict[str, str]] = {
+    "choose_lang": {
+        "en": "🌐 Choose your language:",
+        "ua": "🌐 Оберіть мову:",
+    },
+    "choose_from_cat": {
+        "en": "From which <b>category</b> do you want to convert?",
+        "ua": "З якої <b>категорії</b> ви хочете конвертувати?",
+    },
+    "choose_from_currency": {
+        "en": "— which currency to convert <b>from</b>?",
+        "ua": "— яку валюту конвертувати <b>з</b>?",
+    },
+    "converting_from": {
+        "en": "Converting <b>from {src}</b>.\nTo which <b>category</b>?",
+        "ua": "Конвертую <b>з {src}</b>.\nДо якої <b>категорії</b>?",
+    },
+    "choose_to_currency": {
+        "en": "Converting <b>from {src}</b>.\n{label} — which currency to convert <b>to</b>?",
+        "ua": "Конвертую <b>з {src}</b>.\n{label} — яку валюту конвертувати <b>в</b>?",
+    },
+    "enter_amount": {
+        "en": "<b>{src} → {dst}</b>\nEnter the amount in {src}:",
+        "ua": "<b>{src} → {dst}</b>\nВведіть суму в {src}:",
+    },
+    "fetching": {
+        "en": "⏳ Fetching live rate...",
+        "ua": "⏳ Отримую актуальний курс...",
+    },
+    "error_fetch": {
+        "en": "❌ Could not fetch the exchange rate. Try again later.",
+        "ua": "❌ Не вдалося отримати курс обміну. Спробуйте пізніше.",
+    },
+    "error_number": {
+        "en": "Please enter a valid positive number, e.g. <code>1500</code>",
+        "ua": "Будь ласка, введіть коректне позитивне число, наприклад <code>1500</code>",
+    },
+    "result": {
+        "en": "{amount} {src} = <b>{result} {dst}</b>\n<i>rate: 1 {src} = {rate} {dst}</i>\n\nUse /start to convert again.",
+        "ua": "{amount} {src} = <b>{result} {dst}</b>\n<i>курс: 1 {src} = {rate} {dst}</i>\n\nВикористайте /start для нової конвертації.",
+    },
+    "back": {
+        "en": "⬅️ Back",
+        "ua": "⬅️ Назад",
+    },
+    "lang_updated": {
+        "en": "🌐 Language set to English.",
+        "ua": "🌐 Мову змінено на українську.",
+    },
+}
+
+
+def t(key: str, user_id: int, **kwargs: str) -> str:
+    lang = get_lang(user_id)
+    text = STRINGS[key].get(lang, STRINGS[key]["en"])
+    return text.format(**kwargs) if kwargs else text
+
+
 # -- Currency sets --
 
 METALS = {"XAU", "XAG"}
-
-# Frankfurter handles these (no metals, no UAH, no MDL)
 FRANKFURTER = {"USD", "EUR", "GBP", "PLN", "CZK", "RON"}
-
-# All fiat + metals
 FIAT = FRANKFURTER | {"UAH", "MDL"} | METALS
 
-# Crypto coin IDs for CoinGecko
 CRYPTO_IDS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
@@ -54,32 +119,52 @@ CRYPTO_IDS = {
 }
 CRYPTO = set(CRYPTO_IDS.keys())
 
-# Currencies per category (display order preserved)
 CAT_FIAT = ["UAH", "USD", "EUR", "GBP", "PLN", "CZK", "RON", "MDL"]
 CAT_METALS = ["XAU", "XAG"]
 CAT_CRYPTO = ["BTC", "ETH", "SOL", "USDT"]
 
-CATEGORIES = {
-    "fiat": ("💵 Fiat", CAT_FIAT),
-    "metals": ("🥇 Metals", CAT_METALS),
-    "crypto": ("₿ Crypto", CAT_CRYPTO),
+CATEGORIES: dict[str, tuple[dict[str, str], list[str]]] = {
+    "fiat": ({"en": "💵 Fiat", "ua": "💵 Фіат"}, CAT_FIAT),
+    "metals": ({"en": "🥇 Metals", "ua": "🥇 Метали"}, CAT_METALS),
+    "crypto": ({"en": "₿ Crypto", "ua": "₿ Крипто"}, CAT_CRYPTO),
 }
+
+
+def cat_label(cat_key: str, user_id: int) -> str:
+    lang = get_lang(user_id)
+    labels, _ = CATEGORIES[cat_key]
+    return labels.get(lang, labels["en"])
 
 
 # -- Keyboard builders --
 
 
-def category_keyboard() -> InlineKeyboardMarkup:
+def lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en"),
+                InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang:ua"),
+            ]
+        ]
+    )
+
+
+def category_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text=label, callback_data=f"cat:{key}")
-            for key, (label, _) in CATEGORIES.items()
+            InlineKeyboardButton(
+                text=cat_label(key, user_id), callback_data=f"cat:{key}"
+            )
+            for key in CATEGORIES
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def currency_keyboard(cat_key: str, exclude: str | None = None) -> InlineKeyboardMarkup:
+def currency_keyboard(
+    cat_key: str, user_id: int, exclude: str | None = None
+) -> InlineKeyboardMarkup:
     _, currencies = CATEGORIES[cat_key]
     buttons = [
         InlineKeyboardButton(text=c, callback_data=f"cur:{c}")
@@ -87,8 +172,9 @@ def currency_keyboard(cat_key: str, exclude: str | None = None) -> InlineKeyboar
         if c != exclude
     ]
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-    # back button
-    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="cat:back")])
+    rows.append(
+        [InlineKeyboardButton(text=t("back", user_id), callback_data="cat:back")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -98,7 +184,6 @@ def currency_keyboard(cat_key: str, exclude: str | None = None) -> InlineKeyboar
 async def _nbu_rate_to_uah(
     session: aiohttp.ClientSession, foreign: str
 ) -> float | None:
-    """Returns how many UAH equal 1 unit of `foreign` currency."""
     url = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode={foreign}&json"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
         if r.status != 200:
@@ -112,7 +197,6 @@ async def _nbu_rate_to_uah(
 async def _frankfurter_rate(
     session: aiohttp.ClientSession, src: str, dst: str
 ) -> float | None:
-    """Returns how many DST equal 1 SRC via Frankfurter (pure fiat only)."""
     url = f"https://api.frankfurter.app/latest?from={src}&to={dst}"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
         if r.status != 200:
@@ -124,7 +208,6 @@ async def _frankfurter_rate(
 async def _coingecko_rate(
     session: aiohttp.ClientSession, coin_id: str, vs: str
 ) -> float | None:
-    """Returns the price of `coin_id` in `vs` currency."""
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
         if r.status != 200:
@@ -138,9 +221,7 @@ async def _coingecko_rate(
 
 async def fetch_rate(src: str, dst: str) -> float | None:
     async with aiohttp.ClientSession() as session:
-        # -- fiat/metal ↔ fiat/metal --
         if src in FIAT and dst in FIAT:
-            # UAH involved → NBU directly
             if src == "UAH" or dst == "UAH":
                 foreign = dst if src == "UAH" else src
                 rate_uah = await _nbu_rate_to_uah(session, foreign)
@@ -148,7 +229,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                     return None
                 return (1.0 / rate_uah) if src == "UAH" else rate_uah
 
-            # XAU or XAG involved → bridge through UAH via NBU
             if src in METALS or dst in METALS:
                 src_uah = await _nbu_rate_to_uah(session, src)
                 dst_uah = await _nbu_rate_to_uah(session, dst)
@@ -156,7 +236,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                     return None
                 return src_uah / dst_uah
 
-            # MDL involved → bridge through UAH via NBU
             if src == "MDL" or dst == "MDL":
                 foreign = dst if src == "MDL" else src
                 rate_uah = await _nbu_rate_to_uah(session, foreign)
@@ -165,10 +244,8 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                     return None
                 return (rate_uah / mdl_uah) if dst == "MDL" else (mdl_uah / rate_uah)
 
-            # pure fiat, no metals, no UAH/MDL → Frankfurter
             return await _frankfurter_rate(session, src, dst)
 
-        # -- crypto → fiat/metal --
         if src in CRYPTO and dst in FIAT:
             coin_id = CRYPTO_IDS[src]
             if dst in ("UAH", "MDL") or dst in METALS:
@@ -184,7 +261,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                 return price_usd * (usd_uah / dst_uah)
             return await _coingecko_rate(session, coin_id, dst.lower())
 
-        # -- fiat/metal → crypto --
         if src in FIAT and dst in CRYPTO:
             coin_id = CRYPTO_IDS[dst]
             price_usd = await _coingecko_rate(session, coin_id, "usd")
@@ -201,7 +277,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                 return None
             return 1.0 / rate
 
-        # -- crypto ↔ crypto --
         if src in CRYPTO and dst in CRYPTO:
             src_usd = await _coingecko_rate(session, CRYPTO_IDS[src], "usd")
             dst_usd = await _coingecko_rate(session, CRYPTO_IDS[dst], "usd")
@@ -228,27 +303,71 @@ def fmt_amount(amount: float, currency: str) -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
     await state.clear()
-    await state.set_state(ConvertFlow.choosing_from_cat)
+    user_id = message.from_user.id
+
+    # show lang picker only on first launch
+    if user_id not in user_lang:
+        await state.set_state(ConvertFlow.choosing_lang)
+        await message.answer(t("choose_lang", user_id), reply_markup=lang_keyboard())
+    else:
+        await state.set_state(ConvertFlow.choosing_from_cat)
+        await message.answer(
+            t("choose_from_cat", user_id), reply_markup=category_keyboard(user_id)
+        )
+
+
+@dp.message(Command("language"))
+async def cmd_language(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
+    await state.clear()
+    await state.set_state(ConvertFlow.choosing_lang)
     await message.answer(
-        "From which <b>category</b> do you want to convert?",
-        reply_markup=category_keyboard(),
+        t("choose_lang", message.from_user.id), reply_markup=lang_keyboard()
     )
+
+
+@dp.callback_query(ConvertFlow.choosing_lang, F.data.startswith("lang:"))
+async def chose_lang(callback: CallbackQuery, state: FSMContext) -> None:
+    if (
+        not callback.data
+        or not isinstance(callback.message, Message)
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+    lang = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+    user_lang[user_id] = lang
+
+    await state.set_state(ConvertFlow.choosing_from_cat)
+    await callback.message.edit_text(
+        t("lang_updated", user_id) + "\n\n" + t("choose_from_cat", user_id),
+        reply_markup=category_keyboard(user_id),
+    )
+    await callback.answer()
 
 
 # -- Source: category chosen --
 @dp.callback_query(ConvertFlow.choosing_from_cat, F.data.startswith("cat:"))
 async def chose_from_cat(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.data or not isinstance(callback.message, Message):
+    if (
+        not callback.data
+        or not isinstance(callback.message, Message)
+        or not callback.from_user
+    ):
         await callback.answer()
         return
     cat = callback.data.split(":")[1]
+    user_id = callback.from_user.id
     await state.update_data(from_cat=cat)
     await state.set_state(ConvertFlow.choosing_from)
-    label, _ = CATEGORIES[cat]
     await callback.message.edit_text(
-        f"{label} — which currency to convert <b>from</b>?",
-        reply_markup=currency_keyboard(cat),
+        f"{cat_label(cat, user_id)} {t('choose_from_currency', user_id)}",
+        reply_markup=currency_keyboard(cat, user_id),
     )
     await callback.answer()
 
@@ -256,13 +375,13 @@ async def chose_from_cat(callback: CallbackQuery, state: FSMContext) -> None:
 # -- Source: back to category --
 @dp.callback_query(ConvertFlow.choosing_from, F.data == "cat:back")
 async def back_from_currency(callback: CallbackQuery, state: FSMContext) -> None:
-    if not isinstance(callback.message, Message):
+    if not isinstance(callback.message, Message) or not callback.from_user:
         await callback.answer()
         return
+    user_id = callback.from_user.id
     await state.set_state(ConvertFlow.choosing_from_cat)
     await callback.message.edit_text(
-        "From which <b>category</b> do you want to convert?",
-        reply_markup=category_keyboard(),
+        t("choose_from_cat", user_id), reply_markup=category_keyboard(user_id)
     )
     await callback.answer()
 
@@ -270,15 +389,19 @@ async def back_from_currency(callback: CallbackQuery, state: FSMContext) -> None
 # -- Source: currency chosen --
 @dp.callback_query(ConvertFlow.choosing_from, F.data.startswith("cur:"))
 async def chose_from(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.data or not isinstance(callback.message, Message):
+    if (
+        not callback.data
+        or not isinstance(callback.message, Message)
+        or not callback.from_user
+    ):
         await callback.answer()
         return
     src = callback.data.split(":")[1]
+    user_id = callback.from_user.id
     await state.update_data(src=src)
     await state.set_state(ConvertFlow.choosing_to_cat)
     await callback.message.edit_text(
-        f"Converting <b>from {src}</b>.\nTo which <b>category</b>?",
-        reply_markup=category_keyboard(),
+        t("converting_from", user_id, src=src), reply_markup=category_keyboard(user_id)
     )
     await callback.answer()
 
@@ -286,18 +409,22 @@ async def chose_from(callback: CallbackQuery, state: FSMContext) -> None:
 # -- Target: category chosen --
 @dp.callback_query(ConvertFlow.choosing_to_cat, F.data.startswith("cat:"))
 async def chose_to_cat(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.data or not isinstance(callback.message, Message):
+    if (
+        not callback.data
+        or not isinstance(callback.message, Message)
+        or not callback.from_user
+    ):
         await callback.answer()
         return
     cat = callback.data.split(":")[1]
+    user_id = callback.from_user.id
     data = await state.get_data()
     src = data["src"]
     await state.update_data(to_cat=cat)
     await state.set_state(ConvertFlow.choosing_to)
-    label, _ = CATEGORIES[cat]
     await callback.message.edit_text(
-        f"Converting <b>from {src}</b>.\n{label} — which currency to convert <b>to</b>?",
-        reply_markup=currency_keyboard(cat, exclude=src),
+        t("choose_to_currency", user_id, src=src, label=cat_label(cat, user_id)),
+        reply_markup=currency_keyboard(cat, user_id, exclude=src),
     )
     await callback.answer()
 
@@ -305,15 +432,15 @@ async def chose_to_cat(callback: CallbackQuery, state: FSMContext) -> None:
 # -- Target: back to category --
 @dp.callback_query(ConvertFlow.choosing_to, F.data == "cat:back")
 async def back_to_category(callback: CallbackQuery, state: FSMContext) -> None:
-    if not isinstance(callback.message, Message):
+    if not isinstance(callback.message, Message) or not callback.from_user:
         await callback.answer()
         return
+    user_id = callback.from_user.id
     data = await state.get_data()
     src = data["src"]
     await state.set_state(ConvertFlow.choosing_to_cat)
     await callback.message.edit_text(
-        f"Converting <b>from {src}</b>.\nTo which <b>category</b>?",
-        reply_markup=category_keyboard(),
+        t("converting_from", user_id, src=src), reply_markup=category_keyboard(user_id)
     )
     await callback.answer()
 
@@ -321,43 +448,46 @@ async def back_to_category(callback: CallbackQuery, state: FSMContext) -> None:
 # -- Target: currency chosen --
 @dp.callback_query(ConvertFlow.choosing_to, F.data.startswith("cur:"))
 async def chose_to(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.data or not isinstance(callback.message, Message):
+    if (
+        not callback.data
+        or not isinstance(callback.message, Message)
+        or not callback.from_user
+    ):
         await callback.answer()
         return
     dst = callback.data.split(":")[1]
+    user_id = callback.from_user.id
     data = await state.get_data()
     src = data["src"]
     await state.update_data(dst=dst)
     await state.set_state(ConvertFlow.entering_amt)
-    await callback.message.edit_text(
-        f"<b>{src} → {dst}</b>\nEnter the amount in {src}:"
-    )
+    await callback.message.edit_text(t("enter_amount", user_id, src=src, dst=dst))
     await callback.answer()
 
 
 # -- Amount entered --
 @dp.message(ConvertFlow.entering_amt)
 async def entered_amount(message: Message, state: FSMContext) -> None:
-    if not message.text:
+    if not message.text or not message.from_user:
         return
+    user_id = message.from_user.id
+
     try:
         amount = float(message.text.replace(",", "."))
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer(
-            "Please enter a valid positive number, e.g. <code>1500</code>"
-        )
+        await message.answer(t("error_number", user_id))
         return
 
     data = await state.get_data()
     src, dst = data["src"], data["dst"]
 
-    await message.answer("⏳ Fetching live rate...")
+    await message.answer(t("fetching", user_id))
 
     rate = await fetch_rate(src, dst)
     if rate is None:
-        await message.answer("❌ Could not fetch the exchange rate. Try again later.")
+        await message.answer(t("error_fetch", user_id))
         await state.clear()
         return
 
@@ -365,9 +495,15 @@ async def entered_amount(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     await message.answer(
-        f"{fmt_amount(amount, src)} {src} = <b>{fmt_amount(result, dst)} {dst}</b>\n"
-        f"<i>rate: 1 {src} = {fmt_amount(rate, dst)} {dst}</i>\n\n"
-        "Use /start to convert again."
+        t(
+            "result",
+            user_id,
+            amount=fmt_amount(amount, src),
+            src=src,
+            result=fmt_amount(result, dst),
+            dst=dst,
+            rate=fmt_amount(rate, dst),
+        )
     )
 
 

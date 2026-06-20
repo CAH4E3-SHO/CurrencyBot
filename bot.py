@@ -28,22 +28,21 @@ dp = Dispatcher()
 
 
 class ConvertFlow(StatesGroup):
-    choosing_from = State()  # waiting for source currency
-    choosing_to = State()  # waiting for target currency
-    entering_amt = State()  # waiting for the amount
+    choosing_from_cat = State()  # picking category for source
+    choosing_from = State()  # picking source currency
+    choosing_to_cat = State()  # picking category for target
+    choosing_to = State()  # picking target currency
+    entering_amt = State()  # entering amount
 
 
 # -- Currency sets --
 
 METALS = {"XAU", "XAG"}
 
-# Frankfurter handles these
+# Frankfurter handles these (no metals, no UAH, no MDL)
 FRANKFURTER = {"USD", "EUR", "GBP", "PLN", "CZK", "RON"}
 
-# NBU handles UAH pairs + MDL (NBU publishes MDL rate)
-NBU_SUPPORTED = {"USD", "EUR", "GBP", "PLN", "CZK", "RON", "MDL", "XAU", "XAG"}
-
-# All fiat + metals (no crypto)
+# All fiat + metals
 FIAT = FRANKFURTER | {"UAH", "MDL"} | METALS
 
 # Crypto coin IDs for CoinGecko
@@ -55,26 +54,45 @@ CRYPTO_IDS = {
 }
 CRYPTO = set(CRYPTO_IDS.keys())
 
-# Display order for keyboard
-CURRENCIES = [
-    "UAH",
-    "USD",
-    "EUR",
-    "GBP",
-    "PLN",
-    "CZK",
-    "RON",
-    "MDL",
-    "XAU",
-    "XAG",
-    "BTC",
-    "ETH",
-    "SOL",
-    "USDT",
-]
+# Currencies per category (display order preserved)
+CAT_FIAT = ["UAH", "USD", "EUR", "GBP", "PLN", "CZK", "RON", "MDL"]
+CAT_METALS = ["XAU", "XAG"]
+CAT_CRYPTO = ["BTC", "ETH", "SOL", "USDT"]
+
+CATEGORIES = {
+    "fiat": ("💵 Fiat", CAT_FIAT),
+    "metals": ("🥇 Metals", CAT_METALS),
+    "crypto": ("₿ Crypto", CAT_CRYPTO),
+}
 
 
-#  -- API helpers --
+# -- Keyboard builders --
+
+
+def category_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text=label, callback_data=f"cat:{key}")
+            for key, (label, _) in CATEGORIES.items()
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def currency_keyboard(cat_key: str, exclude: str | None = None) -> InlineKeyboardMarkup:
+    _, currencies = CATEGORIES[cat_key]
+    buttons = [
+        InlineKeyboardButton(text=c, callback_data=f"cur:{c}")
+        for c in currencies
+        if c != exclude
+    ]
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    # back button
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="cat:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# -- API helpers --
 
 
 async def _nbu_rate_to_uah(
@@ -128,11 +146,9 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                 rate_uah = await _nbu_rate_to_uah(session, foreign)
                 if rate_uah is None:
                     return None
-                # 1 UAH = 1/rate_uah FOREIGN  |  1 FOREIGN = rate_uah UAH
                 return (1.0 / rate_uah) if src == "UAH" else rate_uah
 
             # XAU or XAG involved → bridge through UAH via NBU
-            # (Frankfurter doesn't support metals)
             if src in METALS or dst in METALS:
                 src_uah = await _nbu_rate_to_uah(session, src)
                 dst_uah = await _nbu_rate_to_uah(session, dst)
@@ -141,7 +157,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                 return src_uah / dst_uah
 
             # MDL involved → bridge through UAH via NBU
-            # (Frankfurter doesn't support MDL)
             if src == "MDL" or dst == "MDL":
                 foreign = dst if src == "MDL" else src
                 rate_uah = await _nbu_rate_to_uah(session, foreign)
@@ -156,8 +171,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
         # -- crypto → fiat/metal --
         if src in CRYPTO and dst in FIAT:
             coin_id = CRYPTO_IDS[src]
-
-            # CoinGecko doesn't know UAH/MDL/metals → bridge through USD
             if dst in ("UAH", "MDL") or dst in METALS:
                 price_usd = await _coingecko_rate(session, coin_id, "usd")
                 usd_uah = await _nbu_rate_to_uah(session, "USD")
@@ -169,7 +182,6 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                 if dst_uah is None:
                     return None
                 return price_usd * (usd_uah / dst_uah)
-
             return await _coingecko_rate(session, coin_id, dst.lower())
 
         # -- fiat/metal → crypto --
@@ -178,16 +190,12 @@ async def fetch_rate(src: str, dst: str) -> float | None:
             price_usd = await _coingecko_rate(session, coin_id, "usd")
             if price_usd is None:
                 return None
-
-            # CoinGecko doesn't know UAH/MDL/metals → bridge through USD
             if src in ("UAH", "MDL") or src in METALS:
                 src_uah = await _nbu_rate_to_uah(session, src)
                 usd_uah = await _nbu_rate_to_uah(session, "USD")
                 if src_uah is None or usd_uah is None:
                     return None
-                src_in_usd = src_uah / usd_uah
-                return src_in_usd / price_usd
-
+                return (src_uah / usd_uah) / price_usd
             rate = await _coingecko_rate(session, coin_id, src.lower())
             if rate is None:
                 return None
@@ -204,42 +212,62 @@ async def fetch_rate(src: str, dst: str) -> float | None:
     return None
 
 
-# -- Keyboard builder --
-
-
-def currency_keyboard(exclude: str | None = None) -> InlineKeyboardMarkup:
-    """Build a grid of currency buttons, optionally excluding one."""
-    buttons = [
-        InlineKeyboardButton(text=c, callback_data=f"cur:{c}")
-        for c in CURRENCIES
-        if c != exclude
-    ]
-    # arrange into rows of 3
-    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 # -- Formatting helper --
 
 
 def fmt_amount(amount: float, currency: str) -> str:
     if currency in CRYPTO and currency != "USDT":
         return f"{amount:.8f}"
-    if currency in ("XAU", "XAG"):
+    if currency in METALS:
         return f"{amount:.4f}"
     return f"{amount:,.2f}"
 
 
-# -- Handlers
+# -- Handlers --
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await state.set_state(ConvertFlow.choosing_from)
+    await state.set_state(ConvertFlow.choosing_from_cat)
     await message.answer(
-        "From which currency do you want to convert?", reply_markup=currency_keyboard()
+        "From which <b>category</b> do you want to convert?",
+        reply_markup=category_keyboard(),
     )
 
 
+# -- Source: category chosen --
+@dp.callback_query(ConvertFlow.choosing_from_cat, F.data.startswith("cat:"))
+async def chose_from_cat(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.data or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    cat = callback.data.split(":")[1]
+    await state.update_data(from_cat=cat)
+    await state.set_state(ConvertFlow.choosing_from)
+    label, _ = CATEGORIES[cat]
+    await callback.message.edit_text(
+        f"{label} — which currency to convert <b>from</b>?",
+        reply_markup=currency_keyboard(cat),
+    )
+    await callback.answer()
+
+
+# -- Source: back to category --
+@dp.callback_query(ConvertFlow.choosing_from, F.data == "cat:back")
+async def back_from_currency(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    await state.set_state(ConvertFlow.choosing_from_cat)
+    await callback.message.edit_text(
+        "From which <b>category</b> do you want to convert?",
+        reply_markup=category_keyboard(),
+    )
+    await callback.answer()
+
+
+# -- Source: currency chosen --
 @dp.callback_query(ConvertFlow.choosing_from, F.data.startswith("cur:"))
 async def chose_from(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.data or not isinstance(callback.message, Message):
@@ -247,14 +275,50 @@ async def chose_from(callback: CallbackQuery, state: FSMContext) -> None:
         return
     src = callback.data.split(":")[1]
     await state.update_data(src=src)
-    await state.set_state(ConvertFlow.choosing_to)
+    await state.set_state(ConvertFlow.choosing_to_cat)
     await callback.message.edit_text(
-        f"Converting <b>from {src}</b>.\nTo which currency?",
-        reply_markup=currency_keyboard(exclude=src),
+        f"Converting <b>from {src}</b>.\nTo which <b>category</b>?",
+        reply_markup=category_keyboard(),
     )
     await callback.answer()
 
 
+# -- Target: category chosen --
+@dp.callback_query(ConvertFlow.choosing_to_cat, F.data.startswith("cat:"))
+async def chose_to_cat(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.data or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    cat = callback.data.split(":")[1]
+    data = await state.get_data()
+    src = data["src"]
+    await state.update_data(to_cat=cat)
+    await state.set_state(ConvertFlow.choosing_to)
+    label, _ = CATEGORIES[cat]
+    await callback.message.edit_text(
+        f"Converting <b>from {src}</b>.\n{label} — which currency to convert <b>to</b>?",
+        reply_markup=currency_keyboard(cat, exclude=src),
+    )
+    await callback.answer()
+
+
+# -- Target: back to category --
+@dp.callback_query(ConvertFlow.choosing_to, F.data == "cat:back")
+async def back_to_category(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    src = data["src"]
+    await state.set_state(ConvertFlow.choosing_to_cat)
+    await callback.message.edit_text(
+        f"Converting <b>from {src}</b>.\nTo which <b>category</b>?",
+        reply_markup=category_keyboard(),
+    )
+    await callback.answer()
+
+
+# -- Target: currency chosen --
 @dp.callback_query(ConvertFlow.choosing_to, F.data.startswith("cur:"))
 async def chose_to(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.data or not isinstance(callback.message, Message):
@@ -271,6 +335,7 @@ async def chose_to(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+# -- Amount entered --
 @dp.message(ConvertFlow.entering_amt)
 async def entered_amount(message: Message, state: FSMContext) -> None:
     if not message.text:

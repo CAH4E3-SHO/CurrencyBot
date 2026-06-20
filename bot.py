@@ -33,67 +33,164 @@ class ConvertFlow(StatesGroup):
     entering_amt = State()  # waiting for the amount
 
 
-# -- Available currencies --
+# -- Currency sets --
 
-CURRENCIES = ["UAH", "USD", "EUR", "BTC", "GBP", "PLN"]
-FIAT = {"UAH", "USD", "EUR", "GBP", "PLN"}
-CRYPTO = {"BTC"}
+# Frankfurter handles these (including XAU, XAG, CZK, RON)
+FRANKFURTER = {"USD", "EUR", "GBP", "PLN", "CZK", "RON", "XAU", "XAG"}
+
+# NBU handles UAH pairs + MDL (NBU publishes MDL rate)
+NBU_SUPPORTED = {"USD", "EUR", "GBP", "PLN", "CZK", "RON", "MDL", "XAU", "XAG"}
+
+# Al::l fiat + metals (no crypto)
+FIAT = FRANKFURTER | {"UAH", "MDL"}
+
+# Crypto coin IDs for CoinGecko
+CRYPTO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "USDT": "tether",
+}
+CRYPTO = set(CRYPTO_IDS.keys())
+
+# Display order for keyboard
+CURRENCIES = [
+    "UAH",
+    "USD",
+    "EUR",
+    "GBP",
+    "PLN",
+    "CZK",
+    "RON",
+    "MDL",
+    "XAU",
+    "XAG",
+    "BTC",
+    "ETH",
+    "SOL",
+    "USDT",
+]
+
 
 # -- Rate fetching --
 
 
+async def _nbu_rate_to_uah(
+    session: aiohttp.ClientSession, foreign: str
+) -> float | None:
+    """Returns how many UAH equal 1 unit of `foreign` currency."""
+    url = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode={foreign}&json"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200:
+            return None
+        data = await r.json(content_type=None)
+        if not data:
+            return None
+        return float(data[0]["rate"])
+
+
+async def _frankfurter_rate(
+    session: aiohttp.ClientSession, src: str, dst: str
+) -> float | None:
+    """Returns how many DST equal 1 SRC via Frankfurter."""
+    url = f"https://api.frankfurter.app/latest?from={src}&to={dst}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200:
+            return None
+        data = await r.json(content_type=None)
+        return data["rates"].get(dst)
+
+
+async def _coingecko_rate(
+    session: aiohttp.ClientSession, coin_id: str, vs: str
+) -> float | None:
+    """Returns the price of `coin_id` in `vs` currency."""
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        if r.status != 200:
+            return None
+        data = await r.json(content_type=None)
+        return data.get(coin_id, {}).get(vs)
+
+
 async def fetch_rate(src: str, dst: str) -> float | None:
     async with aiohttp.ClientSession() as session:
-        # fiat ↔ fiat involving UAH — use NBU API
-        if "UAH" in (src, dst) and src in FIAT and dst in FIAT:
-            # NBU always returns rate as: 1 foreign currency = X UAH
-            foreign = dst if src == "UAH" else src
-            url = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode={foreign}&json"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                print(f"[DEBUG] {url} -> status {r.status}")
-                if r.status != 200:
+        # -- fiat/metal ↔ fiat/metal --
+        if src in FIAT and dst in FIAT:
+            # UAH involved → use NBU
+            if src == "UAH" or dst == "UAH":
+                foreign = dst if src == "UAH" else src
+                rate_uah = await _nbu_rate_to_uah(session, foreign)
+                if rate_uah is None:
                     return None
-                data = await r.json(content_type=None)
-                if not data:
-                    return None
-                rate_uah = data[0]["rate"]  # 1 FOREIGN = rate_uah UAH
-                # UAH → USD: invert
+                # 1 UAH = 1/rate_uah FOREIGN  |  1 FOREIGN = rate_uah UAH
                 return (1.0 / rate_uah) if src == "UAH" else rate_uah
 
-        # fiat ↔ fiat without UAH — use Frankfurter
-        if src in FIAT and dst in FIAT:
-            url = f"https://api.frankfurter.app/latest?from={src}&to={dst}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                print(f"[DEBUG] {url} -> status {r.status}")
-                if r.status != 200:
+            # MDL involved but not UAH → convert both through UAH as bridge
+            # MDL is not on Frankfurter, so: SRC→UAH→MDL
+            if src == "MDL" or dst == "MDL":
+                foreign = dst if src == "MDL" else src
+                rate_uah = await _nbu_rate_to_uah(session, foreign)
+                mdl_uah = await _nbu_rate_to_uah(session, "MDL")
+                if rate_uah is None or mdl_uah is None:
                     return None
-                data = await r.json(content_type=None)
-                return data["rates"].get(dst)
+                # 1 SRC = rate_uah UAH = rate_uah/mdl_uah MDL
+                return (rate_uah / mdl_uah) if dst == "MDL" else (mdl_uah / rate_uah)
 
-        # fiat → BTC
-        if src in FIAT and dst == "BTC":
-            currency = src.lower()
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={currency}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                print(f"[DEBUG] {url} -> status {r.status}")
-                if r.status != 200:
-                    return None
-                data = await r.json(content_type=None)
-                btc_in_src = data.get("bitcoin", {}).get(currency)
-                if not btc_in_src:
-                    return None
-                return 1.0 / btc_in_src
+            # everything else → Frankfurter
+            return await _frankfurter_rate(session, src, dst)
 
-        # BTC → fiat
-        if src == "BTC" and dst in FIAT:
-            currency = dst.lower()
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={currency}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                print(f"[DEBUG] {url} -> status {r.status}")
-                if r.status != 200:
+        # -- crypto → fiat/metal --
+        if src in CRYPTO and dst in FIAT:
+            coin_id = CRYPTO_IDS[src]
+            vs = dst.lower()
+            # CoinGecko doesn't know UAH/MDL — bridge through USD
+            if dst in ("UAH", "MDL"):
+                price_usd = await _coingecko_rate(session, coin_id, "usd")
+                usd_local = (
+                    await _nbu_rate_to_uah(session, "USD") if dst == "UAH" else None
+                )
+                if dst == "MDL":
+                    usd_uah = await _nbu_rate_to_uah(session, "USD")
+                    mdl_uah = await _nbu_rate_to_uah(session, "MDL")
+                    if price_usd is None or usd_uah is None or mdl_uah is None:
+                        return None
+                    return price_usd * (usd_uah / mdl_uah)
+                if price_usd is None or usd_local is None:
                     return None
-                data = await r.json(content_type=None)
-                return data.get("bitcoin", {}).get(currency)
+                return price_usd * usd_local
+            return await _coingecko_rate(session, coin_id, vs)
+
+        # -- fiat/metal → crypto --
+        if src in FIAT and dst in CRYPTO:
+            coin_id = CRYPTO_IDS[dst]
+            vs = src.lower()
+            if src in ("UAH", "MDL"):
+                usd_rate = await _nbu_rate_to_uah(session, "USD")  # 1 USD = X UAH
+                price_usd = await _coingecko_rate(session, coin_id, "usd")
+                if usd_rate is None or price_usd is None:
+                    return None
+                if src == "UAH":
+                    # 1 UAH = 1/usd_rate USD; 1 USD buys 1/price_usd coins
+                    return (1.0 / usd_rate) / price_usd
+                # MDL bridge
+                mdl_uah = await _nbu_rate_to_uah(session, "MDL")
+                if mdl_uah is None:
+                    return None
+                mdl_in_usd = mdl_uah / usd_rate
+                return mdl_in_usd / price_usd
+            price = await _coingecko_rate(session, coin_id, vs)
+            if price is None:
+                return None
+            return 1.0 / price
+
+        # -- crypto ↔ crypto --
+        if src in CRYPTO and dst in CRYPTO:
+            src_usd = await _coingecko_rate(session, CRYPTO_IDS[src], "usd")
+            dst_usd = await _coingecko_rate(session, CRYPTO_IDS[dst], "usd")
+            if src_usd is None or dst_usd is None:
+                return None
+            return src_usd / dst_usd
 
     return None
 
@@ -111,6 +208,17 @@ def currency_keyboard(exclude: str | None = None) -> InlineKeyboardMarkup:
     # arrange into rows of 3
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# -- Formatting helper --
+
+
+def fmt_amount(amount: float, currency: str) -> str:
+    if currency in CRYPTO and currency != "USDT":
+        return f"{amount:.8f}"
+    if currency in ("XAU", "XAG"):
+        return f"{amount:.4f}"
+    return f"{amount:,.2f}"
 
 
 # -- Handlers
@@ -131,10 +239,9 @@ async def chose_from(callback: CallbackQuery, state: FSMContext) -> None:
     src = callback.data.split(":")[1]
     await state.update_data(src=src)
     await state.set_state(ConvertFlow.choosing_to)
-
     await callback.message.edit_text(
         f"Converting <b>from {src}</b>.\nTo which currency?",
-        reply_markup=currency_keyboard(exclude=src),  # hide the already-chosen one
+        reply_markup=currency_keyboard(exclude=src),
     )
     await callback.answer()
 
@@ -147,10 +254,8 @@ async def chose_to(callback: CallbackQuery, state: FSMContext) -> None:
     dst = callback.data.split(":")[1]
     data = await state.get_data()
     src = data["src"]
-
     await state.update_data(dst=dst)
     await state.set_state(ConvertFlow.entering_amt)
-
     await callback.message.edit_text(
         f"<b>{src} → {dst}</b>\nEnter the amount in {src}:"
     )
@@ -161,7 +266,6 @@ async def chose_to(callback: CallbackQuery, state: FSMContext) -> None:
 async def entered_amount(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
-    # validate input
     try:
         amount = float(message.text.replace(",", "."))
         if amount <= 0:
@@ -186,13 +290,9 @@ async def entered_amount(message: Message, state: FSMContext) -> None:
     result = amount * rate
     await state.clear()
 
-    # BTC gets more decimal places
-    result_fmt = f"{result:.8f}" if dst == "BTC" else f"{result:,.2f}"
-    rate_fmt = f"{rate:.8f}" if dst == "BTC" else f"{rate:,.4f}"
-
     await message.answer(
-        f"{amount:,.2f} {src} = <b>{result_fmt} {dst}</b>\n"
-        f"<i>rate: 1 {src} = {rate_fmt} {dst}</i>\n\n"
+        f"{fmt_amount(amount, src)} {src} = <b>{fmt_amount(result, dst)} {dst}</b>\n"
+        f"<i>rate: 1 {src} = {fmt_amount(rate, dst)} {dst}</i>\n\n"
         "Use /start to convert again."
     )
 

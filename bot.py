@@ -3,6 +3,7 @@ import logging
 import sys
 import asyncio
 
+import aiohttp
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, html, F
 from aiogram.client.default import DefaultBotProperties
@@ -13,7 +14,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
-    message,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,7 +24,7 @@ TOKEN = os.environ["BOT_TOKEN"]
 dp = Dispatcher()
 
 
-# --- FSM States ---
+# -- FSM States --
 
 
 class ConvertFlow(StatesGroup):
@@ -36,6 +36,53 @@ class ConvertFlow(StatesGroup):
 # -- Available currencies --
 
 CURRENCIES = ["UAH", "USD", "EUR", "BTC", "GBP", "PLN"]
+FIAT = {"UAH", "USD", "EUR", "GBP", "PLN"}
+CRYPTO = {"BTC"}
+
+# -- Rate fetching --
+
+
+async def fetch_rate(src: str, dst: str) -> float | None:
+    """
+    Returns how many DST units equal 1 SRC unit.
+    Handles fiat↔fiat, fiat→BTC, BTC→fiat.
+    """
+    async with aiohttp.ClientSession() as session:
+        # fiat ↔ fiat
+        if src in FIAT and dst in FIAT:
+            url = f"https://api.frankfurter.app/latest?from={src}&to={dst}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                return data["rates"].get(dst)
+
+        # fiat → BTC : get BTC price in src currency, then invert
+        if src in FIAT and dst == "BTC":
+            coin_id = "bitcoin"
+            currency = src.lower()
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={currency}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                btc_in_src = data.get(coin_id, {}).get(currency)
+                if not btc_in_src:
+                    return None
+                return 1.0 / btc_in_src  # 1 SRC = X BTC
+
+        # BTC → fiat : get BTC price in dst currency
+        if src == "BTC" and dst in FIAT:
+            coin_id = "bitcoin"
+            currency = dst.lower()
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={currency}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                return data.get(coin_id, {}).get(currency)
+
+    return None  # unsupported pair
 
 
 # -- Keyboard builder --
@@ -115,15 +162,24 @@ async def entered_amount(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     src, dst = data["src"], data["dst"]
 
-    # placeholder rate — real fetch comes next
-    rate = 1.0
-    result = amount * rate
+    await message.answer("⏳ Fetching live rate...")
 
-    await state.clear()  # reset FSM
+    rate = await fetch_rate(src, dst)
+    if rate is None:
+        await message.answer("❌ Could not fetch the exchange rate. Try again later.")
+        await state.clear()
+        return
+
+    result = amount * rate
+    await state.clear()
+
+    # BTC gets more decimal places
+    result_fmt = f"{result:.8f}" if dst == "BTC" else f"{result:,.2f}"
+    rate_fmt = f"{rate:.8f}" if dst == "BTC" else f"{rate:,.4f}"
 
     await message.answer(
-        f"{amount:,.2f} {src} = <b>{result:,.2f} {dst}</b>\n\n"
-        f"(rate: 1 {src} = {rate} {dst})\n\n"
+        f"{amount:,.2f} {src} = <b>{result_fmt} {dst}</b>\n"
+        f"<i>rate: 1 {src} = {rate_fmt} {dst}</i>\n\n"
         "Use /start to convert again."
     )
 

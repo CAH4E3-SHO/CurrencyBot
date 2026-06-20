@@ -43,46 +43,59 @@ CRYPTO = {"BTC"}
 
 
 async def fetch_rate(src: str, dst: str) -> float | None:
-    """
-    Returns how many DST units equal 1 SRC unit.
-    Handles fiat↔fiat, fiat→BTC, BTC→fiat.
-    """
     async with aiohttp.ClientSession() as session:
-        # fiat ↔ fiat
+        # fiat ↔ fiat involving UAH — use NBU API
+        if "UAH" in (src, dst) and src in FIAT and dst in FIAT:
+            # NBU always returns rate as: 1 foreign currency = X UAH
+            foreign = dst if src == "UAH" else src
+            url = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode={foreign}&json"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                print(f"[DEBUG] {url} -> status {r.status}")
+                if r.status != 200:
+                    return None
+                data = await r.json(content_type=None)
+                if not data:
+                    return None
+                rate_uah = data[0]["rate"]  # 1 FOREIGN = rate_uah UAH
+                # UAH → USD: invert
+                return (1.0 / rate_uah) if src == "UAH" else rate_uah
+
+        # fiat ↔ fiat without UAH — use Frankfurter
         if src in FIAT and dst in FIAT:
             url = f"https://api.frankfurter.app/latest?from={src}&to={dst}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                print(f"[DEBUG] {url} -> status {r.status}")
                 if r.status != 200:
                     return None
-                data = await r.json()
+                data = await r.json(content_type=None)
                 return data["rates"].get(dst)
 
-        # fiat → BTC : get BTC price in src currency, then invert
+        # fiat → BTC
         if src in FIAT and dst == "BTC":
-            coin_id = "bitcoin"
             currency = src.lower()
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={currency}"
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={currency}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                print(f"[DEBUG] {url} -> status {r.status}")
                 if r.status != 200:
                     return None
-                data = await r.json()
-                btc_in_src = data.get(coin_id, {}).get(currency)
+                data = await r.json(content_type=None)
+                btc_in_src = data.get("bitcoin", {}).get(currency)
                 if not btc_in_src:
                     return None
-                return 1.0 / btc_in_src  # 1 SRC = X BTC
+                return 1.0 / btc_in_src
 
-        # BTC → fiat : get BTC price in dst currency
+        # BTC → fiat
         if src == "BTC" and dst in FIAT:
-            coin_id = "bitcoin"
             currency = dst.lower()
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={currency}"
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={currency}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                print(f"[DEBUG] {url} -> status {r.status}")
                 if r.status != 200:
                     return None
-                data = await r.json()
-                return data.get(coin_id, {}).get(currency)
+                data = await r.json(content_type=None)
+                return data.get("bitcoin", {}).get(currency)
 
-    return None  # unsupported pair
+    return None
 
 
 # -- Keyboard builder --

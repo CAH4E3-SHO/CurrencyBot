@@ -49,7 +49,7 @@ Supports fiat currencies, precious metals, and crypto — with live exchange rat
 ## Installation
 
 ```bash
-git clone https://github.com/CAH4E3-SHO/currency-bot.git
+git clone https://github.com/CAH4E3-SHO/CurrencyBot
 cd currency-bot
 pip install aiogram python-dotenv aiohttp
 ```

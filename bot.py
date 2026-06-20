@@ -3,6 +3,8 @@ import logging
 import sys
 import asyncio
 import time
+import ast
+import operator
 
 import aiohttp
 from dotenv import load_dotenv
@@ -82,8 +84,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "ua": "❌ Не вдалося отримати курс обміну. Спробуйте пізніше.",
     },
     "error_number": {
-        "en": "Please enter a valid positive number, e.g. <code>1500</code>",
-        "ua": "Будь ласка, введіть коректне позитивне число, наприклад <code>1500</code>",
+        "en": "Please enter a valid positive number or expression, e.g. <code>1500</code> or <code>500*3</code>",
+        "ua": "Будь ласка, введіть коректне позитивне число або вираз, наприклад <code>1500</code> або <code>500*3</code>",
     },
     "result": {
         "en": "{amount} {src} = <b>{result} {dst}</b>\n<i>rate: 1 {src} = {rate} {dst}</i>\n\nUse /start to convert again.",
@@ -163,6 +165,32 @@ def _cache_get(src: str, dst: str) -> float | None:
 
 def _cache_set(src: str, dst: str, rate: float) -> None:
     _cache[f"{src}:{dst}"] = (rate, time.monotonic())
+
+
+# -- Safe arithmetic evaluator --
+
+_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_expr(expr: str) -> float:
+    """Evaluates a simple arithmetic expression safely without eval()."""
+
+    def _eval(node: ast.expr) -> float:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+            return _OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval(node.operand)
+        raise ValueError(f"unsupported node: {ast.dump(node)}")
+
+    tree = ast.parse(expr.strip(), mode="eval")
+    return _eval(tree.body)
 
 
 # -- API helpers --
@@ -526,10 +554,10 @@ async def entered_amount(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
 
     try:
-        amount = float(message.text.replace(",", "."))
+        amount = _eval_expr(message.text.replace(",", "."))
         if amount <= 0:
             raise ValueError
-    except ValueError:
+    except (ValueError, ZeroDivisionError, SyntaxError):
         await message.answer(t("error_number", user_id))
         return
 

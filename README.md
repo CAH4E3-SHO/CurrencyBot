@@ -1,17 +1,40 @@
 # 💱 Currency Converter Bot
 
-A Telegram bot for converting currencies and crypto built with **aiogram 3** and **Python**.  
-Supports fiat currencies (UAH, USD, EUR, GBP, PLN etc.), cryptos, metals — with live exchange rates.
+A Telegram bot for converting currencies and crypto built with **aiogram 3** and **Python**.
+Supports fiat currencies, precious metals, and crypto — with live exchange rates and in-memory caching.
 
 ---
 
 ## Features
 
-- Sequential UX: pick source → target → enter amount
-- Inline keyboard menus, no typing needed
-- Live rates via [exchangerate.host](https://exchangerate.host) (fiat) and [CoinGecko](https://coingecko.com) (BTC)
+- Sequential UX: pick category → pick currency → repeat for target → enter amount
+- Three currency categories: 💵 Fiat, 🥇 Metals, ₿ Crypto
+- 🌐 Bilingual interface: English and Ukrainian
+- Live rates via NBU (fiat + metals), Frankfurter (fiat), and CoinGecko (crypto)
+- In-memory TTL cache — 1 hour for fiat/metals, 2 minutes for crypto
 - FSM-based flow — each user has isolated state
+- ⬅️ Back navigation at every step
 - Input validation with friendly error messages
+
+---
+
+## Supported Currencies
+
+| Category | Currencies |
+|----------|-----------|
+| 💵 Fiat  | UAH, USD, EUR, GBP, PLN, CZK, RON, MDL |
+| 🥇 Metals | XAU (Gold), XAG (Silver) |
+| ₿ Crypto | BTC, ETH, SOL, USDT |
+
+---
+
+## Rate Sources
+
+| Source | Used for |
+|--------|---------|
+| [NBU](https://bank.gov.ua) | UAH, MDL, XAU, XAG pairs |
+| [Frankfurter](https://frankfurter.app) | Pure fiat pairs (no UAH/MDL/metals) |
+| [CoinGecko](https://coingecko.com) | Crypto prices |
 
 ---
 
@@ -25,9 +48,9 @@ Supports fiat currencies (UAH, USD, EUR, GBP, PLN etc.), cryptos, metals — wit
 ## Installation
 
 ```bash
-git clone https://github.com/CAH4E3-SHO/currency-bot.git
+git clone https://github.com/yourname/currency-bot.git
 cd currency-bot
-pip install -r requirements.txt
+pip install aiogram python-dotenv aiohttp
 ```
 
 Create a `.env` file in the project root:
@@ -50,11 +73,14 @@ python bot.py
 
 | Step | Action |
 |------|--------|
-| `/start` | Opens the bot and shows the source currency menu |
-| Pick source | Tap the currency you want to convert **from** |
-| Pick target | Tap the currency you want to convert **to** |
+| `/start` | Opens the bot; shows language picker on first launch |
+| Pick category | 💵 Fiat, 🥇 Metals, or ₿ Crypto |
+| Pick source | Tap the currency to convert **from** |
+| Pick category | Choose target category |
+| Pick target | Tap the currency to convert **to** |
 | Enter amount | Type a number, e.g. `1500` or `3.14` |
 | Result | Bot replies with the converted amount and live rate |
+| `/language` | Switch between English and Ukrainian at any time |
 
 ---
 
@@ -62,21 +88,10 @@ python bot.py
 
 ```
 currency-bot/
-├── bot.py       # Main bot logic (FSM, handlers, keyboards)
-├── requirements.txt  # Python dependencies
-├── .env              # Bot token (not committed)
+├── bot.py        # Main bot logic
+├── .env          # Bot token (not committed)
 └── README.md
 ```
-
----
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `aiogram` | Telegram Bot API framework |
-| `python-dotenv` | Load token from `.env` |
-| `aiohttp` | Async HTTP client for rate APIs |
 
 ---
 

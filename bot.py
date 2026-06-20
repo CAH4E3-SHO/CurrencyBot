@@ -35,14 +35,16 @@ class ConvertFlow(StatesGroup):
 
 # -- Currency sets --
 
-# Frankfurter handles these (including XAU, XAG, CZK, RON)
-FRANKFURTER = {"USD", "EUR", "GBP", "PLN", "CZK", "RON", "XAU", "XAG"}
+METALS = {"XAU", "XAG"}
+
+# Frankfurter handles these
+FRANKFURTER = {"USD", "EUR", "GBP", "PLN", "CZK", "RON"}
 
 # NBU handles UAH pairs + MDL (NBU publishes MDL rate)
 NBU_SUPPORTED = {"USD", "EUR", "GBP", "PLN", "CZK", "RON", "MDL", "XAU", "XAG"}
 
-# Al::l fiat + metals (no crypto)
-FIAT = FRANKFURTER | {"UAH", "MDL"}
+# All fiat + metals (no crypto)
+FIAT = FRANKFURTER | {"UAH", "MDL"} | METALS
 
 # Crypto coin IDs for CoinGecko
 CRYPTO_IDS = {
@@ -72,7 +74,7 @@ CURRENCIES = [
 ]
 
 
-# -- Rate fetching --
+#  -- API helpers --
 
 
 async def _nbu_rate_to_uah(
@@ -92,7 +94,7 @@ async def _nbu_rate_to_uah(
 async def _frankfurter_rate(
     session: aiohttp.ClientSession, src: str, dst: str
 ) -> float | None:
-    """Returns how many DST equal 1 SRC via Frankfurter."""
+    """Returns how many DST equal 1 SRC via Frankfurter (pure fiat only)."""
     url = f"https://api.frankfurter.app/latest?from={src}&to={dst}"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
         if r.status != 200:
@@ -113,11 +115,14 @@ async def _coingecko_rate(
         return data.get(coin_id, {}).get(vs)
 
 
+# -- Rate fetching --
+
+
 async def fetch_rate(src: str, dst: str) -> float | None:
     async with aiohttp.ClientSession() as session:
         # -- fiat/metal ↔ fiat/metal --
         if src in FIAT and dst in FIAT:
-            # UAH involved → use NBU
+            # UAH involved → NBU directly
             if src == "UAH" or dst == "UAH":
                 foreign = dst if src == "UAH" else src
                 rate_uah = await _nbu_rate_to_uah(session, foreign)
@@ -126,63 +131,67 @@ async def fetch_rate(src: str, dst: str) -> float | None:
                 # 1 UAH = 1/rate_uah FOREIGN  |  1 FOREIGN = rate_uah UAH
                 return (1.0 / rate_uah) if src == "UAH" else rate_uah
 
-            # MDL involved but not UAH → convert both through UAH as bridge
-            # MDL is not on Frankfurter, so: SRC→UAH→MDL
+            # XAU or XAG involved → bridge through UAH via NBU
+            # (Frankfurter doesn't support metals)
+            if src in METALS or dst in METALS:
+                src_uah = await _nbu_rate_to_uah(session, src)
+                dst_uah = await _nbu_rate_to_uah(session, dst)
+                if src_uah is None or dst_uah is None:
+                    return None
+                return src_uah / dst_uah
+
+            # MDL involved → bridge through UAH via NBU
+            # (Frankfurter doesn't support MDL)
             if src == "MDL" or dst == "MDL":
                 foreign = dst if src == "MDL" else src
                 rate_uah = await _nbu_rate_to_uah(session, foreign)
                 mdl_uah = await _nbu_rate_to_uah(session, "MDL")
                 if rate_uah is None or mdl_uah is None:
                     return None
-                # 1 SRC = rate_uah UAH = rate_uah/mdl_uah MDL
                 return (rate_uah / mdl_uah) if dst == "MDL" else (mdl_uah / rate_uah)
 
-            # everything else → Frankfurter
+            # pure fiat, no metals, no UAH/MDL → Frankfurter
             return await _frankfurter_rate(session, src, dst)
 
         # -- crypto → fiat/metal --
         if src in CRYPTO and dst in FIAT:
             coin_id = CRYPTO_IDS[src]
-            vs = dst.lower()
-            # CoinGecko doesn't know UAH/MDL — bridge through USD
-            if dst in ("UAH", "MDL"):
+
+            # CoinGecko doesn't know UAH/MDL/metals → bridge through USD
+            if dst in ("UAH", "MDL") or dst in METALS:
                 price_usd = await _coingecko_rate(session, coin_id, "usd")
-                usd_local = (
-                    await _nbu_rate_to_uah(session, "USD") if dst == "UAH" else None
-                )
-                if dst == "MDL":
-                    usd_uah = await _nbu_rate_to_uah(session, "USD")
-                    mdl_uah = await _nbu_rate_to_uah(session, "MDL")
-                    if price_usd is None or usd_uah is None or mdl_uah is None:
-                        return None
-                    return price_usd * (usd_uah / mdl_uah)
-                if price_usd is None or usd_local is None:
+                usd_uah = await _nbu_rate_to_uah(session, "USD")
+                if price_usd is None or usd_uah is None:
                     return None
-                return price_usd * usd_local
-            return await _coingecko_rate(session, coin_id, vs)
+                if dst == "UAH":
+                    return price_usd * usd_uah
+                dst_uah = await _nbu_rate_to_uah(session, dst)
+                if dst_uah is None:
+                    return None
+                return price_usd * (usd_uah / dst_uah)
+
+            return await _coingecko_rate(session, coin_id, dst.lower())
 
         # -- fiat/metal → crypto --
         if src in FIAT and dst in CRYPTO:
             coin_id = CRYPTO_IDS[dst]
-            vs = src.lower()
-            if src in ("UAH", "MDL"):
-                usd_rate = await _nbu_rate_to_uah(session, "USD")  # 1 USD = X UAH
-                price_usd = await _coingecko_rate(session, coin_id, "usd")
-                if usd_rate is None or price_usd is None:
-                    return None
-                if src == "UAH":
-                    # 1 UAH = 1/usd_rate USD; 1 USD buys 1/price_usd coins
-                    return (1.0 / usd_rate) / price_usd
-                # MDL bridge
-                mdl_uah = await _nbu_rate_to_uah(session, "MDL")
-                if mdl_uah is None:
-                    return None
-                mdl_in_usd = mdl_uah / usd_rate
-                return mdl_in_usd / price_usd
-            price = await _coingecko_rate(session, coin_id, vs)
-            if price is None:
+            price_usd = await _coingecko_rate(session, coin_id, "usd")
+            if price_usd is None:
                 return None
-            return 1.0 / price
+
+            # CoinGecko doesn't know UAH/MDL/metals → bridge through USD
+            if src in ("UAH", "MDL") or src in METALS:
+                src_uah = await _nbu_rate_to_uah(session, src)
+                usd_uah = await _nbu_rate_to_uah(session, "USD")
+                if src_uah is None or usd_uah is None:
+                    return None
+                src_in_usd = src_uah / usd_uah
+                return src_in_usd / price_usd
+
+            rate = await _coingecko_rate(session, coin_id, src.lower())
+            if rate is None:
+                return None
+            return 1.0 / rate
 
         # -- crypto ↔ crypto --
         if src in CRYPTO and dst in CRYPTO:

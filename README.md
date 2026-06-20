@@ -10,6 +10,7 @@ Supports fiat currencies, precious metals, and crypto — with live exchange rat
 - Sequential UX: pick category → pick currency → repeat for target → enter amount
 - Three currency categories: 💵 Fiat, 🥇 Metals, ₿ Crypto
 - 🌐 Bilingual interface: English and Ukrainian
+- Arithmetic expressions as input — type `500*3` or `1000/4+200` instead of a plain number
 - Live rates via NBU (fiat + metals), Frankfurter (fiat), and CoinGecko (crypto)
 - In-memory TTL cache — 1 hour for fiat/metals, 2 minutes for crypto
 - FSM-based flow — each user has isolated state
@@ -78,7 +79,7 @@ python bot.py
 | Pick source | Tap the currency to convert **from** |
 | Pick category | Choose target category |
 | Pick target | Tap the currency to convert **to** |
-| Enter amount | Type a number, e.g. `1500` or `3.14` |
+| Enter amount | Type a number or expression: `1500`, `500*3`, `1000/4+200` |
 | Result | Bot replies with the converted amount and live rate |
 | `/language` | Switch between English and Ukrainian at any time |
 

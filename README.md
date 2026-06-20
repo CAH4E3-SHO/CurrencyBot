@@ -50,7 +50,7 @@ Supports fiat currencies, precious metals, and crypto — with live exchange rat
 
 ```bash
 git clone https://github.com/CAH4E3-SHO/CurrencyBot
-cd currency-bot
+cd CurrencyBot
 pip install aiogram python-dotenv aiohttp
 ```
 
